@@ -173,16 +173,16 @@ jobs:
 
       # Email (DESATIVADO em PR)
       - name: Send email
-        if: always() && github.event_name != 'pull_request'
         uses: dawidd6/action-send-mail@v3
         with:
-          server_address: ${{ secrets.SMTP_HOST }}
-          server_port: ${{ secrets.SMTP_PORT }}
+          server_address: smtp.gmail.com
+          server_port: 587
+          secure: false        # << importante p/ 587
           username: ${{ secrets.SMTP_USER }}
           password: ${{ secrets.SMTP_PASS }}
           subject: "[Security CI] WiseBuddyAPI - ${{ github.workflow }} #${{ github.run_number }}"
           from: ${{ secrets.SMTP_FROM }}
           to: ${{ secrets.NOTIFY_TO }}
-          secure: true
           attachments: security-reports/security-report-api.pdf
-          html_body: "<p>Relatório de segurança da API concluído (fork).</p>"
+          html_body: "<p>Relatório de segurança da API concluído.</p>"
+
