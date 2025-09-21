@@ -7,6 +7,13 @@ WORKDIR /app
 # Etapa 3: Copiar o arquivo JAR gerado pelo Spring Boot para o contêiner
 COPY target/wiseBuddy-0.0.1-SNAPSHOT.jar app.jar
 
+# Criar usuário/grupo sem privilégios e ajustar permissões
+RUN groupadd -r app && useradd -r -g app app \
+    && chown -R app:app /app
+
+# Trocar para usuário não-root
+USER app
+
 # Definir o perfil ativo como prod
 ENV SPRING_PROFILES_ACTIVE=prod
 
