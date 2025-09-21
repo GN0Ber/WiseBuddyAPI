@@ -1,0 +1,188 @@
+name: Security CI - API
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch: {}
+
+jobs:
+  sast_sca_dast:
+    runs-on: ubuntu-24.04
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: wisebuddy
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval=10s --health-timeout=5s --health-retries=10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      # SAST
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install semgrep==1.93.0
+      - name: Semgrep (Java)
+        run: semgrep --config p/owasp-top-ten --config p/java --exclude target --error --json --output semgrep-java.json
+      - name: Semgrep (JS/TS - se houver)
+        run: semgrep --config p/owasp-top-ten --config p/javascript --exclude target --severity INFO --json --output semgrep-js.json || true
+
+      # Secrets
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          args: detect --no-banner --redact --report-format json --report-path gitleaks.json
+
+      # Build
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "21" }
+      - uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2-
+      - run: mvn -B -DskipTests package
+
+      # SCA
+      - name: OWASP Dependency-Check
+        uses: dependency-check/Dependency-Check_Action@v4.1.0
+        with:
+          project: "WiseBuddyAPI"
+          path: "."
+          format: "HTML,JSON"
+          args: >
+            --failOnCVSS 7
+            --disableYarnAudit
+            --disableNodeAudit
+        continue-on-error: true
+      - run: |
+          mkdir -p security-reports/api
+          mv dependency-check-report.html security-reports/api/depcheck.html || true
+          mv dependency-check-report.json security-reports/api/depcheck.json || true
+
+      # Seed + subir API para DAST
+      - name: Seed DB
+        run: |
+          cat > seed.sql <<'SQL'
+          CREATE TABLE IF NOT EXISTS users (
+            id BIGINT PRIMARY KEY AUTO_INCREMENT,
+            name VARCHAR(100), email VARCHAR(120) UNIQUE,
+            password VARCHAR(255), role VARCHAR(20)
+          );
+          INSERT IGNORE INTO users (name,email,password,role) VALUES
+            ('Admin','admin@wisebuddy.dev', SHA2('Admin@123',256), 'ADMIN'),
+            ('User','user@wisebuddy.dev',  SHA2('User@123',256),  'USER');
+          SQL
+          sudo apt-get install -y mysql-client
+          mysql -h 127.0.0.1 -uroot -proot wisebuddy < seed.sql
+
+      - name: Run API
+        run: |
+          nohup java -jar target/*.jar \
+            --spring.datasource.url=jdbc:mysql://127.0.0.1:3306/wisebuddy \
+            --spring.datasource.username=root --spring.datasource.password=root \
+            --server.port=8085 --spring.profiles.active=prod > api.log 2>&1 &
+          echo $! > api.pid
+          sleep 20
+          (curl -sSf http://127.0.0.1:8085/v3/api-docs || curl -sSf http://127.0.0.1:8085/) >/dev/null
+
+      # DAST
+      - name: ZAP Baseline (throttled)
+        uses: zaproxy/action-baseline@v0.13.0
+        with:
+          target: "http://127.0.0.1:8085"
+          rules_file_name: ".zap/rules.tsv"
+          cmd_options: >
+            -m 5 --allow-missing --auto --hook=/github/workspace/.zap/login.js
+            --spider -z "spider.maxDuration=2"
+        continue-on-error: true
+
+      - name: Collect ZAP
+        run: |
+          mkdir -p security-reports/api
+          [ -f report_html.html ] && mv report_html.html security-reports/api/zap.html
+          [ -f report_json.json ] && mv report_json.json security-reports/api/zap.json
+          mv api.log security-reports/api/api.log || true
+
+      # HTML + PDF
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - name: Build HTML
+        run: |
+          mkdir -p security-reports
+          node -e "require('fs').writeFileSync('security-reports/index.html', `
+          <!doctype html><html><head><meta charset='utf-8'><title>Relatório de Segurança - API</title>
+          <style>body{font-family:Arial;margin:24px} a{color:#064173}</style></head><body>
+          <h1>Relatório de Segurança - WiseBuddy API</h1>
+          <ul>
+            <li><a href='./api/depcheck.html'>Dependency-Check (HTML)</a></li>
+            <li><a href='./api/zap.html'>ZAP (HTML)</a></li>
+            <li><a href='../semgrep-java.json'>Semgrep Java (JSON)</a></li>
+            <li><a href='../semgrep-js.json'>Semgrep JS (JSON)</a></li>
+            <li><a href='../gitleaks.json'>Gitleaks (JSON)</a></li>
+            <li><a href='./api/api.log'>Logs da API</a></li>
+          </ul>
+          <p>Gerado: ${new Date().toISOString()}</p></body></html>`);"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: security-report-api
+          path: |
+            security-reports/**
+            semgrep-*.json
+            gitleaks.json
+      - name: Generate PDF
+        run: |
+          npm i puppeteer@23
+          node -e "
+          const puppeteer=require('puppeteer');
+          (async()=>{
+            const b=await puppeteer.launch({args:['--no-sandbox']});
+            const p=await b.newPage();
+            await p.goto('file://' + process.cwd() + '/security-reports/index.html',{waitUntil:'load'});
+            await p.pdf({path:'security-reports/security-report-api.pdf', format:'A4', printBackground:true});
+            await b.close();
+          })();"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: security-report-api-pdf
+          path: security-reports/security-report-api.pdf
+
+      # Gates
+      - name: Fail on Semgrep High/Critical
+        run: |
+          jq -e '[.results[] | select(.extra.severity=="ERROR" or .extra.severity=="WARNING")] | length == 0' semgrep-java.json || (echo "Semgrep HIGH/CRITICAL" && exit 1)
+      - name: Fail on DepCheck CVSS >= 9
+        run: |
+          [ -f security-reports/api/depcheck.json ] || exit 0
+          CRIT=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.cvssScore>=9)] | length' security-reports/api/depcheck.json)
+          [ "$CRIT" -gt 0 ] && { echo "Critical CVEs: $CRIT"; exit 1; } || true
+
+      - name: Stop API
+        if: always()
+        run: kill $(cat api.pid) || true
+
+      # Email (DESATIVADO em PR)
+      - name: Send email
+        if: always() && github.event_name != 'pull_request'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_HOST }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USER }}
+          password: ${{ secrets.SMTP_PASS }}
+          subject: "[Security CI] WiseBuddyAPI - ${{ github.workflow }} #${{ github.run_number }}"
+          from: ${{ secrets.SMTP_FROM }}
+          to: ${{ secrets.NOTIFY_TO }}
+          secure: true
+          attachments: security-reports/security-report-api.pdf
+          html_body: "<p>Relatório de segurança da API concluído (fork).</p>"
