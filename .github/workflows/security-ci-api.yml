@@ -130,9 +130,7 @@ jobs:
             -a                    # incluir regras do passive scan
             --auto                # usa automation framework
             -z "spider.maxDuration=2"
-        # Evita que a action tente abrir Issues no repositório
-        env:
-          GITHUB_TOKEN: ""
+          artifact_name: "zap-scan"   # <-- nome corrigido
         continue-on-error: true
 
       - name: Collect ZAP
@@ -141,6 +139,7 @@ jobs:
           [ -f report_html.html ] && mv report_html.html security-reports/api/zap.html || true
           [ -f report_json.json ] && mv report_json.json security-reports/api/zap.json || true
           [ -f api.log ] && mv api.log security-reports/api/api.log || true
+
 
       # ---------- HTML + PDF ----------
       - uses: actions/setup-node@v4
