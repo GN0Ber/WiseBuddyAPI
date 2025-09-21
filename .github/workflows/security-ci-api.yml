@@ -28,40 +28,42 @@ jobs:
       - name: Ensure jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      # SAST
+      # ---------- SAST (Semgrep) ----------
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
       - run: pip install semgrep==1.93.0
-      # --- SAST (Semgrep) ---
+
       - name: Semgrep (Java)
         run: |
           semgrep --config p/owasp-top-ten --config p/java \
                   --exclude target \
-                  --json --output semgrep-java.json   # <- sem --error
-      
+                  --json --output semgrep-java.json
+
       - name: Semgrep (JS/TS)
         run: |
           semgrep --config p/owasp-top-ten --config p/javascript \
                   --exclude target \
-                  --json --output semgrep-js.json || true   # <- sem --severity INFO
+                  --json --output semgrep-js.json || true
 
-      # Secrets
+      # ---------- Secret scanning ----------
       - name: Gitleaks
         uses: gitleaks/gitleaks-action@v2
         with:
           args: detect --no-banner --redact --report-format json --report-path gitleaks.json
 
-      # Build
+      # ---------- Build da API ----------
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: "21" }
+
       - uses: actions/cache@v4
         with:
           path: ~/.m2/repository
           key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
           restore-keys: ${{ runner.os }}-m2-
+
       - run: mvn -B -DskipTests package
 
-      # SCA
+      # ---------- SCA (OWASP Dependency-Check) ----------
       - name: OWASP Dependency-Check
         uses: dependency-check/Dependency-Check_Action@main
         with:
@@ -73,12 +75,14 @@ jobs:
             --disableYarnAudit
             --disableNodeAudit
         continue-on-error: true
-      - run: |
+
+      - name: Move DepCheck reports
+        run: |
           mkdir -p security-reports/api
           mv dependency-check-report.html security-reports/api/depcheck.html || true
           mv dependency-check-report.json security-reports/api/depcheck.json || true
 
-      # Seed + subir API para DAST
+      # ---------- Seed + subir API para DAST ----------
       - name: Seed DB
         run: |
           cat > seed.sql <<'SQL'
@@ -114,20 +118,21 @@ jobs:
           done
           echo "API didn't start in time"; cat api.log || true; exit 1
 
-      # DAST
+      # ---------- DAST (OWASP ZAP) ----------
       - name: ZAP Baseline (throttled)
         uses: zaproxy/action-baseline@v0.13.0
         with:
           target: "http://127.0.0.1:8085"
           rules_file_name: ".zap/rules.tsv"
-          # opções válidas do zap-baseline.py:
           cmd_options: >
-            -m 5                 # minutos de spider/passive scan
-            -I                   # não falha em WARN
-            -a                   # incluir regras do passive scan
-            --auto               # usa o automation framework
-            --hook=/github/workspace/.zap/login.js
+            -m 5                  # minutos de spider/passive scan
+            -I                    # não falha em WARN
+            -a                    # incluir regras do passive scan
+            --auto                # usa automation framework
             -z "spider.maxDuration=2"
+        # Evita que a action tente abrir Issues no repositório
+        env:
+          GITHUB_TOKEN: ""
         continue-on-error: true
 
       - name: Collect ZAP
@@ -137,12 +142,11 @@ jobs:
           [ -f report_json.json ] && mv report_json.json security-reports/api/zap.json || true
           [ -f api.log ] && mv api.log security-reports/api/api.log || true
 
-
-      # HTML + PDF
+      # ---------- HTML + PDF ----------
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      
+
       - name: Build HTML (heredoc)
         run: |
           mkdir -p security-reports
@@ -172,7 +176,7 @@ jobs:
             </body>
           </html>
           HTML
-      
+
       - uses: actions/upload-artifact@v4
         with:
           name: security-report-api
@@ -180,7 +184,7 @@ jobs:
             security-reports/**
             semgrep-*.json
             gitleaks.json
-      
+
       - name: Generate PDF
         run: |
           npm i puppeteer@23
@@ -188,7 +192,6 @@ jobs:
             const fs=require('fs');
             const puppeteer=require('puppeteer');
             (async()=>{
-              // injeta timestamp no HTML
               const htmlPath='security-reports/index.html';
               const html=fs.readFileSync(htmlPath,'utf8').replace('<!-- filled at runtime -->', new Date().toISOString());
               fs.writeFileSync(htmlPath, html);
@@ -199,17 +202,18 @@ jobs:
               await b.close();
             })();
           "
-      
+
       - uses: actions/upload-artifact@v4
         with:
           name: security-report-api-pdf
           path: security-reports/security-report-api.pdf
 
-
-      # Gates
+      # ---------- Gates ----------
       - name: Fail on Semgrep High/Critical
         run: |
-          jq -e '[.results[] | select(.extra.severity=="ERROR" or .extra.severity=="WARNING")] | length == 0' semgrep-java.json || (echo "Semgrep HIGH/CRITICAL" && exit 1)
+          jq -e '[.results[] | select(.extra.severity=="ERROR" or .extra.severity=="WARNING")] | length == 0' semgrep-java.json \
+          || (echo "Semgrep HIGH/CRITICAL" && exit 1)
+
       - name: Fail on DepCheck CVSS >= 9
         run: |
           [ -f security-reports/api/depcheck.json ] || exit 0
@@ -220,13 +224,14 @@ jobs:
         if: always()
         run: kill $(cat api.pid) || true
 
-      # Email (DESATIVADO em PR)
+      # ---------- Email (desativado em PRs) ----------
       - name: Send email
+        if: always() && github.event_name != 'pull_request'
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: smtp.gmail.com
           server_port: 587
-          secure: false        # << importante p/ 587
+          secure: false
           username: ${{ secrets.SMTP_USER }}
           password: ${{ secrets.SMTP_PASS }}
           subject: "[Security CI] WiseBuddyAPI - ${{ github.workflow }} #${{ github.run_number }}"
@@ -234,4 +239,3 @@ jobs:
           to: ${{ secrets.NOTIFY_TO }}
           attachments: security-reports/security-report-api.pdf
           html_body: "<p>Relatório de segurança da API concluído.</p>"
-
