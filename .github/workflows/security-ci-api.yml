@@ -104,43 +104,75 @@ jobs:
           sleep 20
           (curl -sSf http://127.0.0.1:8085/v3/api-docs || curl -sSf http://127.0.0.1:8085/) >/dev/null
 
+      - name: Wait API up
+        run: |
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:8085/v3/api-docs >/dev/null; then
+              echo "API UP"; exit 0
+            fi
+            sleep 2
+          done
+          echo "API didn't start in time"; cat api.log || true; exit 1
+
       # DAST
       - name: ZAP Baseline (throttled)
         uses: zaproxy/action-baseline@v0.13.0
         with:
           target: "http://127.0.0.1:8085"
           rules_file_name: ".zap/rules.tsv"
+          # opções válidas do zap-baseline.py:
           cmd_options: >
-            -m 5 --allow-missing --auto --hook=/github/workspace/.zap/login.js
-            --spider -z "spider.maxDuration=2"
+            -m 5                 # minutos de spider/passive scan
+            -I                   # não falha em WARN
+            -a                   # incluir regras do passive scan
+            --auto               # usa o automation framework
+            --hook=/github/workspace/.zap/login.js
+            -z "spider.maxDuration=2"
         continue-on-error: true
 
       - name: Collect ZAP
         run: |
           mkdir -p security-reports/api
-          [ -f report_html.html ] && mv report_html.html security-reports/api/zap.html
-          [ -f report_json.json ] && mv report_json.json security-reports/api/zap.json
-          mv api.log security-reports/api/api.log || true
+          [ -f report_html.html ] && mv report_html.html security-reports/api/zap.html || true
+          [ -f report_json.json ] && mv report_json.json security-reports/api/zap.json || true
+          [ -f api.log ] && mv api.log security-reports/api/api.log || true
+
 
       # HTML + PDF
       - uses: actions/setup-node@v4
-        with: { node-version: "20" }
-      - name: Build HTML
+        with:
+          node-version: "20"
+      
+      - name: Build HTML (heredoc)
         run: |
           mkdir -p security-reports
-          node -e "require('fs').writeFileSync('security-reports/index.html', `
-          <!doctype html><html><head><meta charset='utf-8'><title>Relatório de Segurança - API</title>
-          <style>body{font-family:Arial;margin:24px} a{color:#064173}</style></head><body>
-          <h1>Relatório de Segurança - WiseBuddy API</h1>
-          <ul>
-            <li><a href='./api/depcheck.html'>Dependency-Check (HTML)</a></li>
-            <li><a href='./api/zap.html'>ZAP (HTML)</a></li>
-            <li><a href='../semgrep-java.json'>Semgrep Java (JSON)</a></li>
-            <li><a href='../semgrep-js.json'>Semgrep JS (JSON)</a></li>
-            <li><a href='../gitleaks.json'>Gitleaks (JSON)</a></li>
-            <li><a href='./api/api.log'>Logs da API</a></li>
-          </ul>
-          <p>Gerado: ${new Date().toISOString()}</p></body></html>`);"
+          cat > security-reports/index.html <<'HTML'
+          <!doctype html>
+          <html>
+            <head>
+              <meta charset="utf-8" />
+              <title>Relatório de Segurança - API</title>
+              <style>
+                body{font-family:Arial;margin:24px}
+                a{color:#064173}
+                pre{background:#111;color:#eee;padding:12px;overflow:auto}
+              </style>
+            </head>
+            <body>
+              <h1>Relatório de Segurança - WiseBuddy API</h1>
+              <ul>
+                <li><a href="./api/depcheck.html">Dependency-Check (HTML)</a></li>
+                <li><a href="./api/zap.html">ZAP (HTML)</a></li>
+                <li><a href="../semgrep-java.json">Semgrep Java (JSON)</a></li>
+                <li><a href="../semgrep-js.json">Semgrep JS (JSON)</a></li>
+                <li><a href="../gitleaks.json">Gitleaks (JSON)</a></li>
+                <li><a href="./api/api.log">Logs da API</a></li>
+              </ul>
+              <p>Gerado: <!-- filled at runtime --></p>
+            </body>
+          </html>
+          HTML
+      
       - uses: actions/upload-artifact@v4
         with:
           name: security-report-api
@@ -148,22 +180,31 @@ jobs:
             security-reports/**
             semgrep-*.json
             gitleaks.json
+      
       - name: Generate PDF
         run: |
           npm i puppeteer@23
           node -e "
-          const puppeteer=require('puppeteer');
-          (async()=>{
-            const b=await puppeteer.launch({args:['--no-sandbox']});
-            const p=await b.newPage();
-            await p.goto('file://' + process.cwd() + '/security-reports/index.html',{waitUntil:'load'});
-            await p.pdf({path:'security-reports/security-report-api.pdf', format:'A4', printBackground:true});
-            await b.close();
-          })();"
+            const fs=require('fs');
+            const puppeteer=require('puppeteer');
+            (async()=>{
+              // injeta timestamp no HTML
+              const htmlPath='security-reports/index.html';
+              const html=fs.readFileSync(htmlPath,'utf8').replace('<!-- filled at runtime -->', new Date().toISOString());
+              fs.writeFileSync(htmlPath, html);
+              const b=await puppeteer.launch({args:['--no-sandbox']});
+              const p=await b.newPage();
+              await p.goto('file://' + process.cwd() + '/' + htmlPath, {waitUntil:'load'});
+              await p.pdf({path:'security-reports/security-report-api.pdf', format:'A4', printBackground:true});
+              await b.close();
+            })();
+          "
+      
       - uses: actions/upload-artifact@v4
         with:
           name: security-report-api-pdf
           path: security-reports/security-report-api.pdf
+
 
       # Gates
       - name: Fail on Semgrep High/Critical
