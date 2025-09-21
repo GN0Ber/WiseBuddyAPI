@@ -32,10 +32,18 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
       - run: pip install semgrep==1.93.0
+      # --- SAST (Semgrep) ---
       - name: Semgrep (Java)
-        run: semgrep --config p/owasp-top-ten --config p/java --exclude target --error --json --output semgrep-java.json
-      - name: Semgrep (JS/TS - se houver)
-        run: semgrep --config p/owasp-top-ten --config p/javascript --exclude target --severity INFO --json --output semgrep-js.json || true
+        run: |
+          semgrep --config p/owasp-top-ten --config p/java \
+                  --exclude target \
+                  --json --output semgrep-java.json   # <- sem --error
+      
+      - name: Semgrep (JS/TS)
+        run: |
+          semgrep --config p/owasp-top-ten --config p/javascript \
+                  --exclude target \
+                  --json --output semgrep-js.json || true   # <- sem --severity INFO
 
       # Secrets
       - name: Gitleaks
